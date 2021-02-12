@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+'''
+Derived from: https://github.com/ragingcomputer/amridm2mqtt.git
+Adapted for Neptune r900 water meter 
+
+Runs rtlamr to watch for broadcasts from meter. If meter id
+is in the list, usage is sent to 'readings/{meter id}/meter_reading'
+topic on the MQTT broker specified in settings.
+
+WATCHED_METERS = A Python list indicating those meter IDs to record and post.
+MQTT_HOST = String containing the MQTT server address.
+MQTT_PORT = An int containing the port the MQTT server is active on.
+
+'''
+import os
+import grp
+import subprocess
+import signal
+import sys
+import time
+import paho.mqtt.publish as publish
+import settings
+import json
+import math
+from dateutil.parser import parse
+
+pidFile = str('/var/run/rtlamr2mqtt/rtlamr2mqtt.pid')
+
+DEBUG = os.environ.get('DEBUG', '').lower() in ['1', 'true', 't']
+MAX_RUNTIME = 5 * 60
+MIN_SLEEPTIME = 5 * 60 
+
+last_reading = {}
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+#---
+
+# uses signal to shutdown and hard kill opened processes and self
+def shutdown(signum, frame):
+    global p_rtltcp
+    global p_rtlamr
+
+    debug_print('Exiting...') 
+    p_rtltcp.send_signal(15)
+    p_rtlamr.send_signal(15)
+    time.sleep(1)
+    p_rtltcp.send_signal(9)
+    p_rtlamr.send_signal(9)
+    time.sleep(1)
+    p_rtltcp.terminate()
+    time.sleep(1)
+    os.kill(p_rtltcp.pid, signal.SIGSTOP)
+    time.sleep(1)
+    os.remove(pidFile)
+    sys.exit(0)
+
+#
+def initialize():
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    writePidFile()
+
+#
+def writePidFile():
+    pidFileDir = os.path.split(os.path.abspath(pidFile))[0]
+    if not os.path.exists(pidFileDir):
+       os.makedirs(pidFileDir)
+       os.chown(pidFileDir, -1, grp.getgrnam("rtlamr2mqtt").gr_gid)
+       
+    pid = str(os.getpid())
+    f = open(pidFile, 'w')
+    f.write(pid)
+    f.close()
+
+#
+def start_rtltcp():
+    global p_rtltcp
+
+    # start the rtl_tcp program
+    p_rtltcp = subprocess.Popen([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True, stdin=None, stdout=None, stderr=None, close_fds=True)
+    time.sleep(5)
+
+# Build rtlamr command from settings
+def getRtlamrCmd():
+    
+    if len(settings.MSGTYPE): 
+       msgtype = ','.join(settings.MSGTYPE) 
+    else: 
+       msgtype='r900' 
+
+    if len(settings.WATCHED_METERS):
+       watch_meters = ','.join(map(str,settings.WATCHED_METERS))
+       filterid_arg = '-filterid='+watch_meters
+    else:
+       filterid_arg = ''
+
+    singleMode = True if settings.RTLAMR_SINGLE_MODE else False
+
+    centerFreq = symbolLength = None 
+    if (settings.RTLAMR_LOW_CPU):
+       singleMode = True
+       symbolLength = 8 
+       centerFreq = '912000000'
+
+    rtlamr_cmd = [settings.RTLAMR, '-msgtype='+msgtype, '-format=json', '-single='+str(singleMode), filterid_arg ]
+    if not centerFreq is None: 
+       rtlamr_cmd.append('-centerfreq='+str(centerFreq))
+    if not symbolLength is None:
+       rtlamr_cmd.append('-symbollength='+str(symbolLength))
+    if (singleMode == True):
+       if not (settings.METER_UPDATE_PERIOD is None):
+          max_duration = MAX_RUNTIME    
+       else:
+          max_duration = MAX_RUNTIME
+       rtlamr_cmd.append('-duration='+str(max_duration)+'s')
+ 
+    return rtlamr_cmd 
+
+#---
+
+#
+def getLastInterval(meter_id):
+    return last_reading.get(meter_id, (None))
+
+#
+def setLastInterval(meter_id, interval_ID):
+    last_reading[meter_id] = (interval_ID)
+
+#
+#
+def checkLastInterval(meter_id, newMessageTime, amr_json):
+    
+    intervalLast = getLastInterval(meter_id)
+      
+    # need two readings to calculate delta so skip calculating rate if no previous data
+    if (intervalLast is None): 
+       setLastInterval(meter_id, amr_json)
+       return None 
+
+    intervalLastTime = intervalLast["Time"]
+
+    # if timestamps are the same, discard this duplicate message 
+    if (newMessageTime == intervalLastTime):
+       debug_print('Warning: current and previous message times match')
+       return None
+
+    # calculate time difference 
+    deltaTime = getDeltaTime(newMessageTime, intervalLastTime)
+
+    # calculate time difference 
+    debug_print('DeltaTime: {}'.format(deltaTime))
+
+    # if time difference is negative, messages are arriving out of order. discard both 
+    if (deltaTime.total_seconds() <= 0):
+       debug_print('Warning: negative deltaTime')
+       setLastInterval(meter_id, None)
+       return None
+
+    # store current amr reading using meter_id as index 
+    setLastInterval(meter_id, amr_json)
+
+    return intervalLast
+
+#
+def getDeltaTime(new_time_json, prev_time_json):
+    # calculate time difference 
+    return ( parse(new_time_json) - parse(prev_time_json) )
+
+
+#
+# calculateFlowRate()
+#
+# return: flowrate in gpm, or -1 on Error
+#
+def calculateFlowRate(deltaTime, currConsumption, prevConsumption ):
+
+    # Calculate consumption since last reading and convert to gallons 
+    # Example: r900 meter reading is in GALLONS*10, set GALLONS_MULTIPLIER to 0.10 
+    delta_gallons = ( currConsumption - prevConsumption ) * settings.GALLONS_MULTIPLIER
+
+    # Calculate consumption rate in gpm
+    #rate_in_gpm = delta_gallons / ( deltaTime.total_seconds() / 60 )
+
+    periods = int(math.floor(deltaTime.total_seconds() / settings.METER_UPDATE_PERIOD))
+    if (periods > 0):
+       rate_in_gpm = delta_gallons / ( (settings.METER_UPDATE_PERIOD * periods)/ 60 )
+    else:
+       rate_in_gpm = None 
+ 
+    debug_print('Rate: {} gpm'.format(rate_in_gpm))
+
+    return rate_in_gpm
+
+# send data to MQTT broker defined in settings
+def send_mqtt(topic, payload, auth ):
+    try:
+        publish.single(topic, payload=payload, qos=1, hostname=settings.MQTT_HOST, port=settings.MQTT_PORT, auth=auth)
+    except Exception as ex:
+        print("MQTT Publish Failed: " + str(ex))
+
+#---
+
+#
+#
+#
+def main():
+    global p_rtlamr 
+ 
+    initialize()
+    # stores last interval id to avoid duplication, includes getter and setter
+    auth = None
+    if len(settings.MQTT_USER) and len(settings.MQTT_PASSWORD):
+       auth = {'username':settings.MQTT_USER, 'password':settings.MQTT_PASSWORD}
+
+    rtlamr_cmd = getRtlamrCmd()
+    start_rtltcp()
+
+    while True:
+       debug_print("Starting rtlamr")
+
+       # start the rtlamr program.
+       p_rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, universal_newlines=True)
+       start_time = time.time() 
+
+       while p_rtlamr.poll() is None:
+          try:
+             amrline = p_rtlamr.stdout.readline().strip()
+             amr_json =  json.loads(amrline)
+             debug_print("{}".format(amr_json))
+
+             # reference Message subtopic as helper
+             message_json=amr_json["Message"]
+             message_time=amr_json["Time"]
+
+             # make sure the meter id is one we want
+             meter_id = message_json["ID"]
+             if settings.WATCHED_METERS and meter_id not in settings.WATCHED_METERS:
+                continue
+
+             # retrieve previous amr reading  
+             intervalLast = checkLastInterval(meter_id, message_time, amr_json)
+ 
+             # calculate flow rate 
+             if not (intervalLast is None):
+                debug_print('Caluculating rate')
+                currConsumption = amr_json["Message"]["Consumption"]
+                prevConsumption = intervalLast["Message"]["Consumption"]
+                deltaTime = getDeltaTime(amr_json["Time"], intervalLast["Time"])
+                debug_print('deltaTime = {}'.format(deltaTime))
+                if (deltaTime.total_seconds() >= settings.METER_UPDATE_PERIOD):
+                   rate_in_gpm = calculateFlowRate(deltaTime, currConsumption, prevConsumption)
+                   debug_print('rate_in_gpm = {}'.format(rate_in_gpm))
+                 
+                   # Add rate to json as supplemental data topic
+                   if not (rate_in_gpm is None):
+                      amr_json["Supplemental"]={'Rate':rate_in_gpm}
+                else:
+                   debug_print('Weird state')
+
+             # Send json payload on topic 'meter/ID/reading' 
+             debug_print('Sending meter {} reading: {}'.format(meter_id, json.dumps(amr_json)))
+             send_mqtt('meter/{}/meter_reading'.format(meter_id), json.dumps(amr_json), auth)
+
+          except Exception as e:
+             debug_print('Exception squashed! {}: {}', e.__class__.__name__, e)
+
+          time.sleep(1)
+
+       # If exiting because rtlamr did not find frequencies within MAX_RUNTIME period, then it has been
+       # running hard for some time and should rest before retrying. Otherwise, signals were found and
+       # we can sleep until the next water meter update period.
+       if ((time.time()-start_time) >= MAX_RUNTIME):
+          debug_print("Presumedly, no signal was found.")
+          delay_time = MIN_SLEEPTIME
+       else:
+          delay_time = max(settings.METER_UPDATE_PERIOD-(time.time()-start_time),0)
+       debug_print("Pausing for {} minutes and {} seconds".format(math.floor(delay_time/60), math.floor(delay_time % 60)))
+       time.sleep(delay_time)
+
+if __name__ == "__main__":
+    # execut only if run as a script
+    main()
+
+
